@@ -1,34 +1,75 @@
 name: Build
-on: push
-permissions: write-all
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 发布版本标签，例如 v1.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      package: ${{ steps.pack.outputs.package }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 1
-      - name: Install zip
-        run: sudo apt-get install -y jq
-      - id: getname
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 校验源码并打包
+        id: pack
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
-          echo "NAME=$(cat info.json | jq '.id' | tr -d '"')" >> "$GITHUB_ENV"
-          echo "ICON=$(cat info.json | jq '.icon' | tr -d '"')" >> "$GITHUB_ENV"
-      - uses: vimtor/action-zip@v1
+          set -euo pipefail
+          if [[ -n "$REQUESTED_TAG" ]]; then
+            git check-ref-format "refs/tags/$REQUESTED_TAG"
+            if git show-ref --verify --quiet "refs/tags/$REQUESTED_TAG"; then
+              test "$(git rev-list -n 1 "refs/tags/$REQUESTED_TAG")" = "$GITHUB_SHA"
+            fi
+          fi
+          node --check main.js
+          file="$(jq -er '.id' info.json).potext"
+          icon="$(jq -er '.icon' info.json)"
+          zip -Xq "$file" info.json "$icon" main.js
+          unzip -t "$file"
+          echo "package=$file" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          files: info.json ${{ env.ICON }} main.js
-          dest: ${{ env.NAME }}.potext
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.NAME }}.potext
-          path: "*.potext"
+          name: ${{ steps.pack.outputs.package }}
+          path: ${{ steps.pack.outputs.package }}
           if-no-files-found: error
-      - name: Upload Release
-        if: startsWith(github.ref, 'refs/tags')
-        uses: softprops/action-gh-release@v2
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency: release-${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          files: "*.potext"
+          name: ${{ needs.build.outputs.package }}
+      - name: 发布 Pot 安装包
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          PACKAGE: ${{ needs.build.outputs.package }}
+        run: |
+          set -euo pipefail
+          if assets="$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>/dev/null)"; then
+            if ! grep -Fxq "$PACKAGE" <<< "$assets"; then
+              gh release upload "$TAG" "$PACKAGE"
+            fi
+          else
+            gh release create "$TAG" "$PACKAGE" --target "$GITHUB_SHA" --title "DeepSeek Flash $TAG" \
+              --notes '下载下方 Assets 中的 .potext 文件。在 Pot 打开 **偏好设置 → 服务设置 → 翻译 → 添加外部插件 → 安装外部插件**，选择该文件，再选择 DeepSeek Flash 并填写自己的 API 密钥。'
+          fi
